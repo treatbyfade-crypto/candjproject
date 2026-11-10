@@ -1,4 +1,4 @@
-﻿<!DOCTYPE html>
+<!DOCTYPE html>
 <html lang="en">
 <head>
 <meta charset="UTF-8"/>
@@ -3502,13 +3502,20 @@ iOS: <a id="currentIosLink" href="#" target="_blank">https://example.com/cj-ios<
 </div>
 <button class="btn btn-primary" id="adminCreateUserButton" type="button" onclick="adminCreateRegularUser()">Create user account</button>
 </div>
+<div class="card admin-danger-card" id="admin-inactive-account-cleanup" style="margin:14px 0;padding:16px">
+<div class="card-title">Remove accounts without active membership</div>
+<p class="admin-danger-copy">Review and permanently delete registered Firebase accounts that have no active membership, including accounts with no completed user profile. Admin accounts are protected. Visitors who only opened the site without creating an account are not stored as accounts and cannot be deleted here.</p>
+<button class="btn btn-outline" id="previewInactiveAccountsButton" type="button" onclick="previewInactiveAccounts()">Preview accounts to remove</button>
+<div id="inactiveAccountsPreview" role="status" aria-live="polite" style="display:none;margin-top:12px"></div>
+<button class="btn btn-danger" id="deleteInactiveAccountsButton" type="button" onclick="deleteInactiveAccounts()" hidden style="margin-top:12px">Delete all listed accounts</button>
+</div>
 <div class="search-box" style="margin-top:12px">
 <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
 <circle cx="11" cy="11" r="8"/>
 <path d="M21 21l-4.35-4.35"/>
 </svg>
 <input class="input" placeholder="Search by name, email or user ID..." id="adminSearch" style="padding-left:46px" oninput="renderAdminUserSuggestions(this.value)" onblur="setTimeout(hideAdminUserSuggestions,150)" onkeydown="if(event.key==='Escape'){hideAdminUserSuggestions()}else if(event.key==='Enter'){hideAdminUserSuggestions();adminSearchUser()}"/>
-<div id="adminUserSuggestions" role="listbox" aria-label="Matching users" style="display:none;position:relative;z-index:5;margin-top:6px;border:1px solid var(--border);border-radius:10px;background:var(--card);box-shadow:var(--shadow-md);overflow:hidden"></div>
+<div id="adminUserSuggestions" role="listbox" aria-label="Matching users" style="display:none;position:relative;z-index:5;margin-top:6px;max-height:320px;overflow:auto;border:1px solid var(--border);border-radius:10px;background:var(--card);box-shadow:var(--shadow-md)"></div>
 </div>
 <button class="btn btn-primary" style="width:auto;padding:12px 20px" onclick="adminSearchUser()">Search</button>
 <div id="adminUserResult" style="display:none;padding:16px;border-radius:12px;background:var(--soft);border:1px solid var(--border);margin-top:16px">
@@ -4305,6 +4312,7 @@ showAllAdminTransactions: false,
 showAllAdminReferrals: false,
 adminTransactionSnapshot: null,
 adminUsersCache: null,
+inactiveAccountPreview: null,
 earningTickerId: null,
 settings: {
 twoFA: false,
@@ -4354,9 +4362,9 @@ const ANNOUNCEMENTS = [
 const WITHDRAWAL_TIERS = [
 { req: 1000, points: 0, timing: 'Anytime', oneTime: true },
 { req: 3000, points: 2, timing: 'Anytime' },
-{ req: 8000, points: 8, timing: 'Anytime' },
-{ req: 15400, points: 15, timing: 'Anytime' },
-{ req: 46154, points: 40, timing: 'Anytime' },
+{ req: 8000, points: 6, timing: 'Anytime' },
+{ req: 15400, points: 10, timing: 'Anytime' },
+{ req: 46154, points: 20, timing: 'Anytime' },
 { req: 92308, points: 80, timing: 'Anytime' },
 { req: 153846, points: 130, timing: 'Anytime' },
 { req: 228615, points: 190, timing: 'Anytime' },
@@ -9849,6 +9857,12 @@ db.collection('lagosLifeDeposits').where('status', '==', 'pending').get(),
 db.collection('transactions').orderBy('date', 'desc').limit(100).get()
 ]);
 const [usersResult, membershipResult, withdrawalsResult, appLinksResult, verificationResult, assetResult, depositResult, lagosLifeDepositResult, transactionResult] = queryResults;
+if (usersResult.status === 'rejected') {
+const errorMessage = usersResult.reason?.message || 'Unknown Firebase query error';
+console.error('Registered users could not be loaded:', errorMessage);
+showToast('Registered users could not be loaded: ' + errorMessage, 'error');
+return;
+}
 const failedQueries = queryResults.filter(result => result.status === 'rejected');
 if (failedQueries.length) {
 const errorMessage = failedQueries.map(result => result.reason?.message || 'Unknown Firebase query error').join('; ');
@@ -10049,12 +10063,16 @@ return [doc.id, data.name, getAccountEmail(data), data.username, data.phone, dat
 const text = String(field || '').toLowerCase();
 return text.includes(query) || text.replace(/[\s_-]+/g, '').includes(normalizedQuery);
 });
-}).slice(0, 8);
+});
 suggestions.replaceChildren();
 if (!matches.length) {
 hideAdminUserSuggestions();
 return;
 }
+const resultCount = document.createElement('div');
+resultCount.textContent = matches.length.toLocaleString() + ' matching account' + (matches.length === 1 ? '' : 's');
+resultCount.style.cssText = 'padding:9px 14px;font-size:12px;color:var(--muted);border-bottom:1px solid var(--border)';
+suggestions.appendChild(resultCount);
 matches.forEach(doc => {
 const data = doc.data();
 const option = document.createElement('button');
@@ -10201,6 +10219,134 @@ if (button) {
 button.disabled = false;
 button.textContent = 'Create user account';
 }
+}
+}
+async function invokeInactiveAccountCleanup(action, confirmation) {
+const user = auth.currentUser;
+if (!user) throw new Error('Sign in again before managing inactive accounts.');
+const idToken = await user.getIdToken();
+const { data, error } = await supabaseClient.functions.invoke('clear-all-data', {
+body: { action, ...(confirmation ? { confirmation } : {}) },
+headers: { Authorization: `Bearer ${idToken}` }
+});
+if (error) throw error;
+return data;
+}
+async function previewInactiveAccounts() {
+if (!isCurrentAdmin()) {
+showToast('Administrator access is required', 'error');
+return;
+}
+const previewButton = document.getElementById('previewInactiveAccountsButton');
+const deleteButton = document.getElementById('deleteInactiveAccountsButton');
+const previewPanel = document.getElementById('inactiveAccountsPreview');
+if (!previewPanel) return;
+if (previewButton) {
+previewButton.disabled = true;
+previewButton.textContent = 'Checking accounts...';
+}
+previewPanel.style.display = 'block';
+previewPanel.textContent = 'Checking registered Firebase accounts for active membership...';
+if (deleteButton) deleteButton.hidden = true;
+AppState.inactiveAccountPreview = null;
+try {
+const result = await invokeInactiveAccountCleanup('previewInactiveAccounts');
+const total = Number(result.inactiveAccountCount || 0);
+const noProfile = Number(result.accountsWithoutProfile || 0);
+const profileInactive = Number(result.inactiveMembershipAccounts || 0);
+AppState.inactiveAccountPreview = total > 0 ? { count: total } : null;
+previewPanel.replaceChildren();
+const summary = document.createElement('p');
+summary.style.cssText = 'margin:0 0 8px;font-weight:600';
+summary.textContent = total.toLocaleString() + ' account' + (total === 1 ? '' : 's') +
+' found without active membership (' + profileInactive.toLocaleString() + ' inactive profile' +
+(profileInactive === 1 ? '' : 's') + ', ' + noProfile.toLocaleString() + ' without a completed profile).';
+previewPanel.appendChild(summary);
+const accounts = Array.isArray(result.accounts) ? result.accounts : [];
+if (accounts.length) {
+const list = document.createElement('ul');
+list.style.cssText = 'margin:0 0 8px;padding-left:22px;max-height:180px;overflow:auto';
+accounts.forEach(account => {
+const item = document.createElement('li');
+item.textContent = [account.name || 'Unnamed account', account.email || account.uid || ''].filter(Boolean).join(' · ');
+list.appendChild(item);
+});
+previewPanel.appendChild(list);
+if (total > accounts.length) {
+const remainder = document.createElement('div');
+remainder.style.cssText = 'font-size:12px;color:var(--muted)';
+remainder.textContent = 'Showing ' + accounts.length.toLocaleString() + ' of ' + total.toLocaleString() + ' accounts.';
+previewPanel.appendChild(remainder);
+}
+} else if (total === 0) {
+const empty = document.createElement('div');
+empty.textContent = 'No eligible accounts were found. Nothing will be deleted.';
+previewPanel.appendChild(empty);
+}
+if (deleteButton) deleteButton.hidden = total === 0;
+} catch (error) {
+console.error('Could not preview inactive accounts:', error);
+previewPanel.textContent = 'Accounts could not be checked: ' + (error.message || 'Unknown error');
+showToast('Could not preview accounts: ' + (error.message || 'Unknown error'), 'error');
+} finally {
+if (previewButton) {
+previewButton.disabled = false;
+previewButton.textContent = 'Refresh account preview';
+}
+}
+}
+async function deleteInactiveAccounts() {
+if (!isCurrentAdmin()) {
+showToast('Administrator access is required', 'error');
+return;
+}
+const preview = AppState.inactiveAccountPreview;
+if (!preview?.count) {
+showToast('Preview the accounts first. No accounts have been selected for deletion.', 'error');
+return;
+}
+const confirmation = window.prompt(
+'This permanently deletes ' + preview.count.toLocaleString() +
+' Firebase accounts currently found without active membership, their user-related Firestore records, and their uploaded identity/profile/receipt files. The eligible accounts are checked again before deletion, so the final count may change. Admin accounts are kept. Type DELETE INACTIVE ACCOUNTS to continue.'
+);
+if (confirmation !== 'DELETE INACTIVE ACCOUNTS') {
+showToast('Account removal cancelled. Nothing was deleted.', 'error');
+return;
+}
+const deleteButton = document.getElementById('deleteInactiveAccountsButton');
+const previewButton = document.getElementById('previewInactiveAccountsButton');
+if (deleteButton) {
+deleteButton.disabled = true;
+deleteButton.textContent = 'Deleting accounts...';
+}
+if (previewButton) previewButton.disabled = true;
+try {
+const result = await invokeInactiveAccountCleanup('deleteInactiveAccounts', confirmation);
+AppState.inactiveAccountPreview = null;
+AppState.adminUsersCache = null;
+const previewPanel = document.getElementById('inactiveAccountsPreview');
+if (previewPanel) {
+previewPanel.textContent = 'Removed ' + Number(result.authAccountsDeleted || 0).toLocaleString() +
+' account(s), ' + Number(result.firestoreDocumentsDeleted || 0).toLocaleString() +
+' related record(s), and ' + Number(result.storageFilesDeleted || 0).toLocaleString() + ' uploaded file(s).';
+}
+if (deleteButton) deleteButton.hidden = true;
+showToast('Inactive accounts and their related records were removed.', 'success');
+try {
+await loadAdminPanelData();
+} catch (error) {
+console.error('Inactive accounts were removed, but the admin panel could not refresh:', error);
+showToast('Accounts were removed, but the admin list could not refresh: ' + error.message, 'error');
+}
+} catch (error) {
+console.error('Could not delete inactive accounts:', error);
+showToast('Inactive accounts could not be deleted: ' + (error.message || 'Unknown error'), 'error');
+} finally {
+if (deleteButton) {
+deleteButton.disabled = false;
+deleteButton.textContent = 'Delete all listed accounts';
+}
+if (previewButton) previewButton.disabled = false;
 }
 }
 async function adminSearchUser() {
