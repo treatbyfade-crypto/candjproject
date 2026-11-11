@@ -73,7 +73,12 @@ async function getGoogleAccessToken(): Promise<string> {
   return result.access_token;
 }
 
-async function googleRequest(url: string, accessToken: string, init: RequestInit = {}): Promise<any> {
+async function googleRequest(
+  url: string,
+  accessToken: string,
+  init: RequestInit = {},
+  allowNotFound = false
+): Promise<any> {
   const headers = new Headers(init.headers);
   headers.set("Authorization", `Bearer ${accessToken}`);
   if (init.body) headers.set("Content-Type", "application/json");
@@ -88,6 +93,7 @@ async function googleRequest(url: string, accessToken: string, init: RequestInit
       result = { message: text };
     }
   }
+  if (allowNotFound && response.status === 404) return null;
   if (!response.ok) {
     throw new Error(`Google API ${response.status}: ${result.error?.message || result.message || response.statusText}`);
   }
@@ -120,8 +126,14 @@ async function listStorageFiles(storage: any, folder = ""): Promise<string[]> {
   return paths;
 }
 
-async function listFirebaseUsers(accessToken: string): Promise<string[]> {
-  const localIds: string[] = [];
+type FirebaseAccount = {
+  localId: string;
+  email?: string;
+  displayName?: string;
+};
+
+async function listFirebaseUserAccounts(accessToken: string): Promise<FirebaseAccount[]> {
+  const accounts: FirebaseAccount[] = [];
   let nextPageToken = "";
 
   do {
@@ -129,11 +141,80 @@ async function listFirebaseUsers(accessToken: string): Promise<string[]> {
     url.searchParams.set("maxResults", "1000");
     if (nextPageToken) url.searchParams.set("nextPageToken", nextPageToken);
     const result = await googleRequest(url.toString(), accessToken);
-    localIds.push(...(result.users || []).map((user: { localId: string }) => user.localId));
+    accounts.push(...(result.users || []).map((user: FirebaseAccount) => ({
+      localId: user.localId,
+      email: user.email,
+      displayName: user.displayName
+    })));
     nextPageToken = result.nextPageToken || "";
   } while (nextPageToken);
 
-  return localIds;
+  return accounts;
+}
+
+async function listFirebaseUsers(accessToken: string): Promise<string[]> {
+  return (await listFirebaseUserAccounts(accessToken)).map((user) => user.localId);
+}
+
+type FirebaseUserProfile = {
+  uid: string;
+  name: string;
+  email: string;
+  activeMembership: boolean;
+  isAdmin: boolean;
+};
+
+async function listFirebaseUserProfiles(accessToken: string): Promise<FirebaseUserProfile[]> {
+  const profiles: FirebaseUserProfile[] = [];
+  let pageToken = "";
+
+  do {
+    const url = new URL(`https://firestore.googleapis.com/v1/${encodeResourceName(`${FIREBASE_ROOT}/users`)}`);
+    url.searchParams.set("pageSize", "300");
+    if (pageToken) url.searchParams.set("pageToken", pageToken);
+    const result = await googleRequest(url.toString(), accessToken);
+    for (const document of result.documents || []) {
+      const fields = document.fields || {};
+      const membership = fields.membership?.mapValue?.fields || {};
+      const role = String(fields.role?.stringValue || "").toLowerCase();
+      profiles.push({
+        uid: String(document.name || "").split("/").pop() || "",
+        name: String(fields.name?.stringValue || ""),
+        email: String(fields.email?.stringValue || fields.emailLower?.stringValue || ""),
+        activeMembership: membership.active?.booleanValue === true ||
+          String(membership.status?.stringValue || "").toLowerCase() === "active",
+        isAdmin: role === "admin"
+      });
+    }
+    pageToken = result.nextPageToken || "";
+  } while (pageToken);
+
+  return profiles;
+}
+
+async function findInactiveFirebaseAccounts(accessToken: string, adminUid: string) {
+  const [accounts, profiles] = await Promise.all([
+    listFirebaseUserAccounts(accessToken),
+    listFirebaseUserProfiles(accessToken)
+  ]);
+  const profilesByUid = new Map(profiles.map((profile) => [profile.uid, profile]));
+  return accounts
+    .filter((account) => {
+      const profile = profilesByUid.get(account.localId);
+      return account.localId !== adminUid &&
+        String(account.email || "").trim().toLowerCase() !== ADMIN_EMAIL &&
+        !profile?.isAdmin &&
+        !profile?.activeMembership;
+    })
+    .map((account) => {
+      const profile = profilesByUid.get(account.localId);
+      return {
+        uid: account.localId,
+        email: profile?.email || account.email || "",
+        name: profile?.name || account.displayName || "",
+        hasProfile: Boolean(profile)
+      };
+    });
 }
 
 async function deleteFirebaseUsers(accessToken: string, localIds: string[]): Promise<void> {
@@ -191,8 +272,87 @@ async function deleteDocumentTree(documentName: string, accessToken: string): Pr
       deleted += await deleteDocumentTree(childDocument, accessToken);
     }
   }
-  await googleRequest(`https://firestore.googleapis.com/v1/${encodeResourceName(documentName)}`, accessToken, { method: "DELETE" });
-  return deleted + 1;
+  const result = await googleRequest(
+    `https://firestore.googleapis.com/v1/${encodeResourceName(documentName)}`,
+    accessToken,
+    { method: "DELETE" },
+    true
+  );
+  return deleted + (result === null ? 0 : 1);
+}
+
+function stringFieldValue(fields: Record<string, any>, key: string): string {
+  const field = fields[key];
+  return String(field?.stringValue || "");
+}
+
+async function deleteUserRelatedDocument(
+  documentName: string,
+  collectionId: string,
+  accessToken: string,
+  userIds: Set<string>
+): Promise<number> {
+  const documentId = documentName.split("/").pop() || "";
+  if ((collectionId === "users" || collectionId === "verifications") && userIds.has(documentId)) {
+    return await deleteDocumentTree(documentName, accessToken);
+  }
+
+  const document = await googleRequest(
+    `https://firestore.googleapis.com/v1/${encodeResourceName(documentName)}`,
+    accessToken,
+    {},
+    true
+  );
+  const fields = document?.fields || {};
+  const ownerFields = [
+    "userId",
+    "uid",
+    "ownerId",
+    "userUid",
+    "memberId",
+    "sellerId",
+    "senderId",
+    "recipientId",
+    "participantId",
+    "followerId",
+    "followingId"
+  ];
+  if (ownerFields.some((field) => userIds.has(stringFieldValue(fields, field)))) {
+    return await deleteDocumentTree(documentName, accessToken);
+  }
+
+  let deleted = 0;
+  for (const childCollection of await listCollectionIds(documentName, accessToken)) {
+    for (const childDocument of await listDocuments(documentName, childCollection, accessToken)) {
+      deleted += await deleteUserRelatedDocument(childDocument, childCollection, accessToken, userIds);
+    }
+  }
+  return deleted;
+}
+
+async function deleteUserRelatedFirestoreData(accessToken: string, userIds: string[]): Promise<number> {
+  if (!userIds.length) return 0;
+  const userIdSet = new Set(userIds);
+  let deleted = 0;
+  for (const collectionId of await listCollectionIds(FIREBASE_ROOT, accessToken)) {
+    for (const documentName of await listDocuments(FIREBASE_ROOT, collectionId, accessToken)) {
+      deleted += await deleteUserRelatedDocument(documentName, collectionId, accessToken, userIdSet);
+    }
+  }
+  return deleted;
+}
+
+async function deleteUserStorageFiles(storage: any, userIds: string[]): Promise<number> {
+  if (!userIds.length) return 0;
+  const userIdSet = new Set(userIds);
+  const files = (await listStorageFiles(storage)).filter((path) =>
+    path.split("/").some((segment) => userIdSet.has(segment))
+  );
+  for (let offset = 0; offset < files.length; offset += 100) {
+    const { error } = await storage.from(SUPABASE_BUCKET).remove(files.slice(offset, offset + 100));
+    if (error) throw new Error(`Could not delete user-uploaded files: ${error.message}`);
+  }
+  return files.length;
 }
 
 async function deleteFirestoreData(accessToken: string, adminUid: string): Promise<number> {
@@ -227,10 +387,115 @@ Deno.serve(async request => {
     const adminUid = String(payload.sub || "");
     const callerEmail = String(payload.email || "").trim().toLowerCase();
     if (!adminUid || callerEmail !== ADMIN_EMAIL) {
-      return jsonResponse(403, { error: "Only the signed-in administrator can clear application data." }, origin);
+      return jsonResponse(403, { error: "Only the signed-in administrator can manage application accounts." }, origin);
     }
 
     const body = await request.json();
+    const action = String(body.action || "clearAllData");
+    if (!["clearAllData", "previewInactiveAccounts", "deleteInactiveAccounts", "deleteUserAccount"].includes(action)) {
+      return jsonResponse(400, { error: "The requested account-management action is not supported." }, origin);
+    }
+
+    if (action === "deleteUserAccount") {
+      const targetUid = String(body.targetUid || "").trim();
+      if (!targetUid || targetUid.length > 128) {
+        return jsonResponse(400, { error: "A valid user account ID is required." }, origin);
+      }
+      if (targetUid === adminUid) {
+        return jsonResponse(403, { error: "You cannot delete the administrator account you are signed in with." }, origin);
+      }
+
+      const accessToken = await getGoogleAccessToken();
+      const [accounts, profile] = await Promise.all([
+        listFirebaseUserAccounts(accessToken),
+        googleRequest(
+          `https://firestore.googleapis.com/v1/${encodeResourceName(`${FIREBASE_ROOT}/users/${targetUid}`)}`,
+          accessToken,
+          {},
+          true
+        )
+      ]);
+      const account = accounts.find((candidate) => candidate.localId === targetUid);
+      if (!account && !profile) {
+        return jsonResponse(404, { error: "The selected account no longer exists." }, origin);
+      }
+      const profileFields = profile?.fields || {};
+      const profileRole = String(profileFields.role?.stringValue || "").trim().toLowerCase();
+      const profileEmail = String(profileFields.email?.stringValue || profileFields.emailLower?.stringValue || "").trim().toLowerCase();
+      const accountEmail = String(account?.email || "").trim().toLowerCase();
+      if (profileRole === "admin" || profileEmail === ADMIN_EMAIL || accountEmail === ADMIN_EMAIL) {
+        return jsonResponse(403, { error: "Administrator accounts are protected from deletion." }, origin);
+      }
+
+      const confirmationEmails = [...new Set([profileEmail, accountEmail].filter(Boolean))];
+      const confirmationMatches = confirmationEmails.some(email => body.confirmation === `DELETE USER ${email}`);
+      const confirmationMatchesUid = !confirmationEmails.length && body.confirmation === `DELETE USER ${targetUid}`;
+      if (!confirmationMatches && !confirmationMatchesUid) {
+        return jsonResponse(400, { error: "The selected user's exact confirmation phrase is required." }, origin);
+      }
+
+      const supabaseUrl = Deno.env.get("SUPABASE_URL");
+      const supabaseServiceRoleKey = Deno.env.get("SUPABASE_SERVICE_ROLE_KEY");
+      if (!supabaseUrl || !supabaseServiceRoleKey) throw new Error("Supabase server credentials are not configured.");
+      const supabase = createClient(supabaseUrl, supabaseServiceRoleKey);
+      const firestoreDocumentsDeleted = await deleteUserRelatedFirestoreData(accessToken, [targetUid]);
+      const storageFilesDeleted = await deleteUserStorageFiles(supabase.storage, [targetUid]);
+      if (account) await deleteFirebaseUsers(accessToken, [targetUid]);
+
+      return jsonResponse(200, {
+        authAccountsDeleted: account ? 1 : 0,
+        firestoreDocumentsDeleted,
+        storageFilesDeleted,
+        email: account?.email || profileEmail
+      }, origin);
+    }
+
+    if (action === "previewInactiveAccounts" || action === "deleteInactiveAccounts") {
+      if (action === "deleteInactiveAccounts" && body.confirmation !== "DELETE INACTIVE ACCOUNTS") {
+        return jsonResponse(400, { error: "The required inactive-account confirmation phrase is missing." }, origin);
+      }
+
+      const accessToken = await getGoogleAccessToken();
+      const inactiveAccounts = await findInactiveFirebaseAccounts(accessToken, adminUid);
+      if (action === "previewInactiveAccounts") {
+        const accountsWithoutProfile = inactiveAccounts.filter((account) => !account.hasProfile).length;
+        const requestedOffset = Number(body.offset);
+        const requestedLimit = Number(body.limit);
+        const offset = Number.isSafeInteger(requestedOffset) && requestedOffset >= 0 ? requestedOffset : 0;
+        const limit = Number.isSafeInteger(requestedLimit) && requestedLimit > 0
+          ? Math.min(requestedLimit, 200)
+          : 100;
+        return jsonResponse(200, {
+          inactiveAccountCount: inactiveAccounts.length,
+          accountsWithoutProfile,
+          inactiveMembershipAccounts: inactiveAccounts.length - accountsWithoutProfile,
+          offset,
+          limit,
+          accounts: inactiveAccounts.slice(offset, offset + limit).map(({ uid, email, name, hasProfile }) => ({
+            uid,
+            email,
+            name,
+            hasProfile
+          }))
+        }, origin);
+      }
+
+      const supabaseUrl = Deno.env.get("SUPABASE_URL");
+      const supabaseServiceRoleKey = Deno.env.get("SUPABASE_SERVICE_ROLE_KEY");
+      if (!supabaseUrl || !supabaseServiceRoleKey) throw new Error("Supabase server credentials are not configured.");
+      const supabase = createClient(supabaseUrl, supabaseServiceRoleKey);
+      const userIds = inactiveAccounts.map((account) => account.uid);
+      const firestoreDocumentsDeleted = await deleteUserRelatedFirestoreData(accessToken, userIds);
+      const storageFilesDeleted = await deleteUserStorageFiles(supabase.storage, userIds);
+      await deleteFirebaseUsers(accessToken, userIds);
+
+      return jsonResponse(200, {
+        authAccountsDeleted: userIds.length,
+        firestoreDocumentsDeleted,
+        storageFilesDeleted
+      }, origin);
+    }
+
     if (body.confirmation !== "CLEAR ALL DATA") {
       return jsonResponse(400, { error: "The required confirmation phrase is missing." }, origin);
     }
