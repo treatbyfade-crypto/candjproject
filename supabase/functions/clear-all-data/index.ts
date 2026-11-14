@@ -5,6 +5,12 @@ import {
   jwtVerify,
   SignJWT
 } from "npm:jose@5.9.6";
+import {
+  STALE_NEVER_ACTIVATED_ACCOUNT_RETENTION_MS,
+  isStaleNeverActivatedAccount,
+  membershipHasStarted,
+  timestampMillis
+} from "./cleanup-eligibility.ts";
 
 const FIREBASE_PROJECT_ID = Deno.env.get("FIREBASE_PROJECT_ID") ?? "candjproject-1485c";
 const SUPABASE_BUCKET = "cj-uploads";
@@ -130,6 +136,7 @@ type FirebaseAccount = {
   localId: string;
   email?: string;
   displayName?: string;
+  createdAt?: string;
 };
 
 async function listFirebaseUserAccounts(accessToken: string): Promise<FirebaseAccount[]> {
@@ -144,7 +151,8 @@ async function listFirebaseUserAccounts(accessToken: string): Promise<FirebaseAc
     accounts.push(...(result.users || []).map((user: FirebaseAccount) => ({
       localId: user.localId,
       email: user.email,
-      displayName: user.displayName
+      displayName: user.displayName,
+      createdAt: user.createdAt
     })));
     nextPageToken = result.nextPageToken || "";
   } while (nextPageToken);
@@ -161,6 +169,8 @@ type FirebaseUserProfile = {
   name: string;
   email: string;
   activeMembership: boolean;
+  membershipEverActivated: boolean;
+  createdAtMillis: number | null;
   isAdmin: boolean;
 };
 
@@ -183,6 +193,12 @@ async function listFirebaseUserProfiles(accessToken: string): Promise<FirebaseUs
         email: String(fields.email?.stringValue || fields.emailLower?.stringValue || ""),
         activeMembership: membership.active?.booleanValue === true ||
           String(membership.status?.stringValue || "").toLowerCase() === "active",
+        membershipEverActivated: membershipHasStarted(membership),
+        createdAtMillis: timestampMillis(
+          fields.createdAt?.timestampValue ||
+          fields.createdAt?.stringValue ||
+          fields.createdAt?.integerValue
+        ),
         isAdmin: role === "admin"
       });
     }
@@ -190,6 +206,23 @@ async function listFirebaseUserProfiles(accessToken: string): Promise<FirebaseUs
   } while (pageToken);
 
   return profiles;
+}
+
+async function findStaleNeverActivatedAccounts(accessToken: string, cutoffMillis: number) {
+  const [accounts, profiles] = await Promise.all([
+    listFirebaseUserAccounts(accessToken),
+    listFirebaseUserProfiles(accessToken)
+  ]);
+  const profilesByUid = new Map(profiles.map((profile) => [profile.uid, profile]));
+  return accounts
+    .filter((account) => {
+      const profile = profilesByUid.get(account.localId);
+      return isStaleNeverActivatedAccount(account, profile, cutoffMillis, ADMIN_EMAIL);
+    })
+    .map((account) => ({
+      uid: account.localId,
+      email: profilesByUid.get(account.localId)?.email || account.email || ""
+    }));
 }
 
 async function findInactiveFirebaseAccounts(accessToken: string, adminUid: string) {
@@ -376,6 +409,45 @@ Deno.serve(async request => {
   if (request.method !== "POST") return jsonResponse(405, { error: "Use POST." }, origin);
 
   try {
+    const body = await request.json();
+    const action = String(body.action || "clearAllData");
+
+    if (action === "deleteStaleNeverActivatedAccounts") {
+      const expectedSecret = Deno.env.get("INACTIVE_ACCOUNT_CLEANUP_CRON_SECRET");
+      const providedSecret = request.headers.get("x-cron-secret");
+      if (!expectedSecret || !providedSecret || providedSecret !== expectedSecret) {
+        return jsonResponse(401, { error: "The scheduled cleanup request is not authorized." }, origin);
+      }
+
+      const accessToken = await getGoogleAccessToken();
+      const cutoffMillis = Date.now() - STALE_NEVER_ACTIVATED_ACCOUNT_RETENTION_MS;
+      const accounts = await findStaleNeverActivatedAccounts(accessToken, cutoffMillis);
+      const userIds = accounts.map((account) => account.uid);
+      if (!userIds.length) {
+        return jsonResponse(200, {
+          authAccountsDeleted: 0,
+          firestoreDocumentsDeleted: 0,
+          storageFilesDeleted: 0
+        }, origin);
+      }
+
+      const supabaseUrl = Deno.env.get("SUPABASE_URL");
+      const supabaseServiceRoleKey = Deno.env.get("SUPABASE_SERVICE_ROLE_KEY");
+      if (!supabaseUrl || !supabaseServiceRoleKey) {
+        throw new Error("Supabase server credentials are not configured.");
+      }
+      const supabase = createClient(supabaseUrl, supabaseServiceRoleKey);
+      const firestoreDocumentsDeleted = await deleteUserRelatedFirestoreData(accessToken, userIds);
+      const storageFilesDeleted = await deleteUserStorageFiles(supabase.storage, userIds);
+      await deleteFirebaseUsers(accessToken, userIds);
+
+      return jsonResponse(200, {
+        authAccountsDeleted: userIds.length,
+        firestoreDocumentsDeleted,
+        storageFilesDeleted
+      }, origin);
+    }
+
     const authorization = request.headers.get("Authorization") || "";
     const idToken = authorization.match(/^Bearer\s+(.+)$/i)?.[1];
     if (!idToken) return jsonResponse(401, { error: "A Firebase sign-in token is required." }, origin);
@@ -390,8 +462,6 @@ Deno.serve(async request => {
       return jsonResponse(403, { error: "Only the signed-in administrator can manage application accounts." }, origin);
     }
 
-    const body = await request.json();
-    const action = String(body.action || "clearAllData");
     if (!["clearAllData", "previewInactiveAccounts", "deleteInactiveAccounts", "deleteUserAccount"].includes(action)) {
       return jsonResponse(400, { error: "The requested account-management action is not supported." }, origin);
     }
