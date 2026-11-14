@@ -17,6 +17,8 @@ type FirestoreMembershipFields = Record<string, {
   integerValue?: string | number;
 } | undefined>;
 
+export const STALE_NEVER_ACTIVATED_ACCOUNT_RETENTION_MS = 90 * 24 * 60 * 60 * 1000;
+
 export function timestampMillis(value: unknown): number | null {
   if (typeof value === "number" && Number.isFinite(value)) return value;
   if (typeof value !== "string" || !value.trim()) return null;
