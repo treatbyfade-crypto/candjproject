@@ -1,0 +1,8 @@
+supabase/.temp/
+.env
+.env.*
+!.env.example
+node_modules/
+.firebase/
+firebase-debug.log
+firebase-debug.*.log
