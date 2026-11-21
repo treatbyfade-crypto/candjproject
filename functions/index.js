@@ -1,4 +1,4 @@
-const { randomInt, randomUUID } = require('node:crypto');
+const { randomInt, randomUUID, randomBytes, pbkdf2, timingSafeEqual } = require('node:crypto');
 const { initializeApp } = require('firebase-admin/app');
 const { FieldValue, getFirestore } = require('firebase-admin/firestore');
 const { onCall, HttpsError } = require('firebase-functions/v2/https');
@@ -24,10 +24,477 @@ const MIN_STAKE = 3000;
 const PLAYER_CLOCK_MS = 10 * 60 * 1000;
 const TIME_OPTIONS_MINUTES = [1, 3, 5, 10];
 const QUEUE_TTL_MS = 15 * 60 * 1000;
+const DAY_MS = 24 * 60 * 60 * 1000;
+const DAILY_EARNING_AMOUNT = 1000;
 
 function requireUid(request) {
   if (!request.auth) throw new HttpsError('unauthenticated', 'Sign in before playing chess.');
   return request.auth.uid;
+}
+
+function verifyTransferPin(pin, salt, expectedHash) {
+  return new Promise((resolve, reject) => {
+    pbkdf2(pin, Buffer.from(salt, 'base64'), 180000, 32, 'sha256', (error, derivedKey) => {
+      if (error) {
+        reject(error);
+        return;
+      }
+      const expected = Buffer.from(expectedHash, 'base64');
+      resolve(expected.length === derivedKey.length && timingSafeEqual(expected, derivedKey));
+    });
+  });
+}
+
+function deriveTransferPinHash(pin, salt) {
+  return new Promise((resolve, reject) => {
+    pbkdf2(pin, salt, 180000, 32, 'sha256', (error, derivedKey) => {
+      if (error) reject(error);
+      else resolve(derivedKey.toString('base64'));
+    });
+  });
+}
+
+async function setTransferPin(request) {
+  if (!request.auth) throw new HttpsError('unauthenticated', 'Sign in before setting a Transfer PIN.');
+  const uid = request.auth.uid;
+  const pin = request.data && request.data.pin;
+  if (typeof pin !== 'string' || !/^\d{4,6}$/.test(pin)) {
+    throw new HttpsError('invalid-argument', 'Transfer PIN must contain 4 to 6 digits.');
+  }
+  const userRef = db.collection('users').doc(uid);
+  const pinRef = db.collection('transferPins').doc(uid);
+  const salt = randomBytes(16).toString('base64');
+  const hash = await deriveTransferPinHash(pin, Buffer.from(salt, 'base64'));
+  await db.runTransaction(async transaction => {
+    const userSnapshot = await transaction.get(userRef);
+    if (!userSnapshot.exists) throw new HttpsError('not-found', 'Your account record could not be found.');
+    transaction.set(pinRef, {
+      salt,
+      hash,
+      updatedAt: FieldValue.serverTimestamp()
+    });
+    transaction.update(userRef, {
+      hasTransferPin: true,
+      transferPinSalt: FieldValue.delete(),
+      transferPinHash: FieldValue.delete(),
+      transferPinUpdatedAt: FieldValue.delete()
+    });
+  });
+  return { hasTransferPin: true };
+}
+
+async function transferWallet(request) {
+  if (!request.auth) throw new HttpsError('unauthenticated', 'Sign in before sending a transfer.');
+  const uid = request.auth.uid;
+  const { recipientId, amount: rawAmount, note: rawNote = '', pin, requestId } = request.data || {};
+  const amount = Number(rawAmount);
+  if (typeof recipientId !== 'string' || !recipientId || recipientId.length > 128 || recipientId === uid) {
+    throw new HttpsError('invalid-argument', 'Choose another valid C&J member.');
+  }
+  if (!Number.isSafeInteger(amount) || amount <= 0 || amount > Math.floor(Number.MAX_SAFE_INTEGER / 2)) {
+    throw new HttpsError('invalid-argument', 'Transfer amount must be a positive whole number.');
+  }
+  if (typeof pin !== 'string' || !/^\d{4,6}$/.test(pin)) {
+    throw new HttpsError('invalid-argument', 'Enter your 4 to 6 digit Transfer PIN.');
+  }
+  if (typeof requestId !== 'string' || !/^[A-Za-z0-9_-]{20,36}$/.test(requestId)) {
+    throw new HttpsError('invalid-argument', 'This transfer request is invalid. Try again.');
+  }
+  const note = typeof rawNote === 'string' ? rawNote.trim().slice(0, 240) : '';
+  const senderRef = db.collection('users').doc(uid);
+  const recipientRef = db.collection('users').doc(recipientId);
+  const pinRef = db.collection('transferPins').doc(uid);
+  const attemptsRef = db.collection('transferPinAttempts').doc(uid);
+  const [senderSnapshot, pinSnapshot, attemptsSnapshot] = await Promise.all([
+    senderRef.get(),
+    pinRef.get(),
+    attemptsRef.get()
+  ]);
+  if (!senderSnapshot.exists) throw new HttpsError('not-found', 'Your account record could not be found.');
+  const senderData = senderSnapshot.data();
+  const legacyPin = !pinSnapshot.exists;
+  const pinData = pinSnapshot.exists
+    ? pinSnapshot.data()
+    : { salt: senderData.transferPinSalt, hash: senderData.transferPinHash };
+  const lockedUntil = Number(attemptsSnapshot.exists ? attemptsSnapshot.data().lockedUntil || 0 : 0);
+  if (lockedUntil > Date.now()) {
+    throw new HttpsError('resource-exhausted', 'Too many incorrect PIN attempts. Try again later.');
+  }
+  if (typeof pinData.salt !== 'string' || typeof pinData.hash !== 'string') {
+    throw new HttpsError('failed-precondition', 'Create a Transfer PIN in Settings before requesting a transfer.');
+  }
+  if (!await verifyTransferPin(pin, pinData.salt, pinData.hash)) {
+    await db.runTransaction(async transaction => {
+      const currentAttempts = await transaction.get(attemptsRef);
+      const now = Date.now();
+      const recentFailures = currentAttempts.exists && now - Number(currentAttempts.data().windowStartedAt || 0) < 15 * 60 * 1000
+        ? Number(currentAttempts.data().failedCount || 0)
+        : 0;
+      const failedCount = recentFailures + 1;
+      transaction.set(attemptsRef, {
+        failedCount,
+        windowStartedAt: recentFailures ? Number(currentAttempts.data().windowStartedAt) : now,
+        lockedUntil: failedCount >= 5 ? now + 15 * 60 * 1000 : 0
+      });
+    });
+    throw new HttpsError('permission-denied', 'Incorrect Transfer PIN.');
+  }
+  if (legacyPin) {
+    await db.runTransaction(async transaction => {
+      const [currentUser, currentPin] = await Promise.all([
+        transaction.get(senderRef),
+        transaction.get(pinRef)
+      ]);
+      if (!currentPin.exists && currentUser.exists &&
+          currentUser.data().transferPinSalt === pinData.salt &&
+          currentUser.data().transferPinHash === pinData.hash) {
+        transaction.set(pinRef, {
+          salt: pinData.salt,
+          hash: pinData.hash,
+          updatedAt: FieldValue.serverTimestamp()
+        });
+        transaction.update(senderRef, {
+          hasTransferPin: true,
+          transferPinSalt: FieldValue.delete(),
+          transferPinHash: FieldValue.delete(),
+          transferPinUpdatedAt: FieldValue.delete()
+        });
+      }
+    });
+  }
+  await attemptsRef.set({ failedCount: 0, windowStartedAt: Date.now(), lockedUntil: 0 });
+
+  const requestRef = db.collection('walletTransfers').doc(uid + '_' + requestId);
+  const senderLedgerRef = db.collection('transactions').doc('transfer_' + uid + '_' + requestId + '_sent');
+  const recipientLedgerRef = db.collection('transactions').doc('transfer_' + uid + '_' + requestId + '_received');
+  const senderNotificationRef = db.collection('notifications').doc();
+  const recipientNotificationRef = db.collection('notifications').doc();
+
+  return db.runTransaction(async transaction => {
+    const [existingRequest, currentSender, currentPin, recipientSnapshot] = await Promise.all([
+      transaction.get(requestRef),
+      transaction.get(senderRef),
+      transaction.get(pinRef),
+      transaction.get(recipientRef)
+    ]);
+    if (existingRequest.exists) {
+      const saved = existingRequest.data();
+      if (saved.senderId !== uid || saved.recipientId !== recipientId || saved.amount !== amount) {
+        throw new HttpsError('already-exists', 'This transfer request ID was already used.');
+      }
+      return { balance: saved.senderBalanceAfter, recipientName: saved.recipientName, amount };
+    }
+    if (!currentSender.exists || !recipientSnapshot.exists) {
+      throw new HttpsError('not-found', 'Sender or recipient account could not be found.');
+    }
+    if (!currentPin.exists || currentPin.data().salt !== pinData.salt || currentPin.data().hash !== pinData.hash) {
+      throw new HttpsError('failed-precondition', 'Your Transfer PIN changed. Try again.');
+    }
+    const sender = currentSender.data();
+    const recipient = recipientSnapshot.data();
+    if (!sender.membership?.active) {
+      throw new HttpsError('failed-precondition', 'Activate your membership before sending transfers.');
+    }
+    if (['frozen', 'disabled'].includes(sender.accountStatus)) {
+      throw new HttpsError('permission-denied', 'Your account cannot send transfers while restricted.');
+    }
+    if (['frozen', 'disabled'].includes(recipient.accountStatus)) {
+      throw new HttpsError('failed-precondition', 'This recipient account cannot receive transfers.');
+    }
+    const senderBalance = Number(sender.balance || 0);
+    const recipientBalance = Number(recipient.balance || 0);
+    if (!Number.isSafeInteger(senderBalance) || senderBalance < amount ||
+        !Number.isSafeInteger(recipientBalance) || recipientBalance < 0 ||
+        !Number.isSafeInteger(recipientBalance + amount)) {
+      throw new HttpsError('failed-precondition', 'A wallet balance is invalid or insufficient.');
+    }
+    const senderName = accountName(sender, uid);
+    const recipientName = accountName(recipient, recipientId);
+    const now = FieldValue.serverTimestamp();
+    const senderBalanceAfter = senderBalance - amount;
+    transaction.update(senderRef, { balance: senderBalanceAfter });
+    transaction.update(recipientRef, { balance: recipientBalance + amount });
+    transaction.set(senderLedgerRef, {
+      userId: uid, userName: senderName, personName: recipientName,
+      type: 'transfer_sent', amount: -amount, recipientUserId: recipientId,
+      recipientName, note, date: now, status: 'completed'
+    });
+    transaction.set(recipientLedgerRef, {
+      userId: recipientId, userName: recipientName, personName: senderName,
+      type: 'transfer_received', amount, senderUserId: uid, senderName,
+      note, date: now, status: 'completed'
+    });
+    transaction.set(senderNotificationRef, {
+      userId: uid, title: 'Transfer sent',
+      message: 'N' + amount.toLocaleString() + ' sent to ' + recipientName + '.',
+      read: false, createdAt: now
+    });
+    transaction.set(recipientNotificationRef, {
+      userId: recipientId, title: 'Transfer received',
+      message: 'N' + amount.toLocaleString() + ' received from ' + senderName + '.',
+      read: false, createdAt: now
+    });
+    transaction.create(requestRef, {
+      senderId: uid, recipientId, amount, senderBalanceAfter, recipientName,
+      createdAt: now
+    });
+    return { balance: senderBalanceAfter, recipientName, amount };
+  });
+}
+
+async function adjustWalletAsAdmin(request) {
+  if (!request.auth) throw new HttpsError('unauthenticated', 'Sign in before adjusting a wallet.');
+  const adminEmail = String(request.auth.token.email || '').trim().toLowerCase();
+  if (adminEmail !== 'admin@cj.com') {
+    throw new HttpsError('permission-denied', 'Administrator access is required.');
+  }
+  const {
+    userId,
+    balanceType = 'wallet',
+    action,
+    amount: rawAmount,
+    reason: rawReason = '',
+    requestId
+  } = request.data || {};
+  const amount = Number(rawAmount);
+  if (typeof userId !== 'string' || !userId || userId.length > 128) {
+    throw new HttpsError('invalid-argument', 'Choose a valid member account.');
+  }
+  if (!['wallet', 'lagosLife'].includes(balanceType) ||
+      !['credit', 'debit'].includes(action) ||
+      (balanceType === 'lagosLife' && action !== 'credit')) {
+    throw new HttpsError('invalid-argument', 'This wallet adjustment type is invalid.');
+  }
+  if (!Number.isSafeInteger(amount) || amount <= 0 || amount > Math.floor(Number.MAX_SAFE_INTEGER / 2)) {
+    throw new HttpsError('invalid-argument', 'Enter a positive whole-number amount.');
+  }
+  if (typeof requestId !== 'string' || !/^[A-Za-z0-9_-]{20,36}$/.test(requestId)) {
+    throw new HttpsError('invalid-argument', 'This adjustment request is invalid. Try again.');
+  }
+  const reason = typeof rawReason === 'string' ? rawReason.trim().slice(0, 240) : '';
+  const adminUid = request.auth.uid;
+  const userRef = db.collection('users').doc(userId);
+  const ledgerCollection = balanceType === 'lagosLife' ? 'lagosLifeTransactions' : 'transactions';
+  const balanceField = balanceType === 'lagosLife' ? 'lagosLifeBalance' : 'balance';
+  const requestRef = db.collection('adminWalletAdjustments').doc(adminUid + '_' + requestId);
+  const ledgerRef = db.collection(ledgerCollection).doc('admin_' + adminUid + '_' + requestId);
+  const notificationRef = db.collection('notifications').doc();
+  return db.runTransaction(async transaction => {
+    const [existingRequest, userSnapshot] = await Promise.all([
+      transaction.get(requestRef),
+      transaction.get(userRef)
+    ]);
+    if (existingRequest.exists) {
+      const saved = existingRequest.data();
+      if (saved.userId !== userId || saved.balanceType !== balanceType ||
+          saved.action !== action || saved.amount !== amount) {
+        throw new HttpsError('already-exists', 'This adjustment request ID was already used.');
+      }
+      return { balance: saved.balanceAfter, memberName: saved.memberName };
+    }
+    if (!userSnapshot.exists) throw new HttpsError('not-found', 'Member account could not be found.');
+    const user = userSnapshot.data();
+    const currentBalance = Number(user[balanceField] || 0);
+    const balanceAfter = action === 'credit' ? currentBalance + amount : currentBalance - amount;
+    if (!Number.isSafeInteger(currentBalance) || currentBalance < 0 ||
+        !Number.isSafeInteger(balanceAfter) || balanceAfter < 0) {
+      throw new HttpsError('failed-precondition', 'The wallet balance cannot safely accept this adjustment.');
+    }
+    const memberName = String(user.name || user.email || userId).slice(0, 80);
+    const signedAmount = action === 'credit' ? amount : -amount;
+    const label = action === 'credit' ? 'Balance credited' : 'Balance debited';
+    const now = FieldValue.serverTimestamp();
+    transaction.update(userRef, { [balanceField]: balanceAfter });
+    transaction.set(ledgerRef, {
+      userId,
+      userName: memberName,
+      userEmail: String(user.email || ''),
+      type: balanceType === 'lagosLife' ? 'admin_credit' : 'admin_' + action,
+      personName: memberName,
+      description: label + ' by administrator: ' + (reason || 'Administrator balance adjustment'),
+      amount: signedAmount,
+      date: now,
+      status: 'completed',
+      adminId: adminUid,
+      adminName: String(request.auth.token.name || 'Administrator').slice(0, 80),
+      reason
+    });
+    transaction.set(notificationRef, {
+      userId,
+      title: balanceType === 'lagosLife' ? 'Lagos Life funds added' : label,
+      message: balanceType === 'lagosLife'
+        ? 'An administrator added N' + amount.toLocaleString() + ' to your Lagos Life balance. Reason: ' + (reason || 'Administrator Lagos Life funding') + '.'
+        : 'Your wallet balance was ' + (action === 'credit' ? 'increased' : 'decreased') + ' by N' + amount.toLocaleString() + '. Reason: ' + (reason || 'Administrator balance adjustment') + '.',
+      read: false,
+      createdAt: now,
+      type: action === 'credit' ? 'deposit' : 'withdrawal'
+    });
+    transaction.create(requestRef, {
+      adminId: adminUid,
+      userId,
+      balanceType,
+      action,
+      amount,
+      balanceAfter,
+      memberName,
+      createdAt: now
+    });
+    return { balance: balanceAfter, memberName };
+  });
+}
+
+function timestampMillis(value) {
+  if (value && typeof value.toMillis === 'function') {
+    const millis = value.toMillis();
+    return Number.isFinite(millis) ? millis : null;
+  }
+  if (value instanceof Date) return Number.isFinite(value.getTime()) ? value.getTime() : null;
+  if (typeof value === 'string' || typeof value === 'number') {
+    const millis = new Date(value).getTime();
+    return Number.isFinite(millis) ? millis : null;
+  }
+  return null;
+}
+
+function assertRewardAccount(data) {
+  if (!data) throw new HttpsError('not-found', 'Your account record could not be found.');
+  if (['frozen', 'disabled'].includes(data.accountStatus)) {
+    throw new HttpsError('permission-denied', 'Your account cannot earn while restricted.');
+  }
+  if (data.membership?.active !== true) {
+    throw new HttpsError('failed-precondition', 'Your membership must be active first.');
+  }
+}
+
+async function claimDailyEarning(request) {
+  const uid = requireUid(request);
+  const userRef = db.collection('users').doc(uid);
+  return db.runTransaction(async transaction => {
+    const userSnapshot = await transaction.get(userRef);
+    if (!userSnapshot.exists) throw new HttpsError('not-found', 'Your account record could not be found.');
+    const user = userSnapshot.data();
+    assertRewardAccount(user);
+    const now = Date.now();
+    const membership = user.membership || {};
+    const dueAt = timestampMillis(membership.nextEarningAt) ||
+      (timestampMillis(membership.startAt) !== null ? timestampMillis(membership.startAt) + DAY_MS : null);
+    const lastCheckin = timestampMillis(user.dailyCheckin && user.dailyCheckin.lastCheckinAt) ||
+      timestampMillis(membership.startAt);
+    const currentBalance = Number(user.balance || 0);
+    const totalEarned = Number(user.totalEarned || 0);
+    if (!Number.isSafeInteger(currentBalance) || currentBalance < 0 ||
+        !Number.isSafeInteger(totalEarned) || totalEarned < 0) {
+      throw new HttpsError('failed-precondition', 'Your wallet or earnings balance is invalid.');
+    }
+    if (dueAt === null || now < dueAt || lastCheckin === null || now - lastCheckin >= DAY_MS) {
+      return { credited: false, balance: currentBalance, totalEarned, nextEarningAt: dueAt };
+    }
+    const ledgerId = 'daily_' + uid + '_' + dueAt;
+    const ledgerRef = db.collection('transactions').doc(ledgerId);
+    const ledgerSnapshot = await transaction.get(ledgerRef);
+    if (ledgerSnapshot.exists) {
+      return { credited: false, balance: currentBalance, totalEarned, nextEarningAt: dueAt };
+    }
+    const balance = currentBalance + DAILY_EARNING_AMOUNT;
+    const earned = totalEarned + DAILY_EARNING_AMOUNT;
+    if (!Number.isSafeInteger(balance) || !Number.isSafeInteger(earned)) {
+      throw new HttpsError('failed-precondition', 'Your wallet cannot safely accept this earning.');
+    }
+    const nextEarningAt = dueAt + DAY_MS;
+    transaction.update(userRef, {
+      balance,
+      totalEarned: earned,
+      'membership.nextEarningAt': new Date(nextEarningAt)
+    });
+    transaction.create(ledgerRef, {
+      userId: uid,
+      userName: accountName(user, uid),
+      type: 'earning',
+      description: 'Daily C&J earning',
+      amount: DAILY_EARNING_AMOUNT,
+      date: FieldValue.serverTimestamp(),
+      status: 'completed'
+    });
+    return { credited: true, amount: DAILY_EARNING_AMOUNT, balance, totalEarned: earned, nextEarningAt };
+  });
+}
+
+async function claimDailyCheckin(request) {
+  const uid = requireUid(request);
+  const userRef = db.collection('users').doc(uid);
+  return db.runTransaction(async transaction => {
+    const userSnapshot = await transaction.get(userRef);
+    if (!userSnapshot.exists) throw new HttpsError('not-found', 'Your account record could not be found.');
+    const user = userSnapshot.data();
+    assertRewardAccount(user);
+    const membership = user.membership || {};
+    if (membership.status && membership.status !== 'active') {
+      throw new HttpsError('failed-precondition', 'Check-in is available after your membership is approved.');
+    }
+    const now = Date.now();
+    const previous = timestampMillis(user.dailyCheckin && user.dailyCheckin.lastCheckinAt);
+    if (previous !== null && now - previous < DAY_MS) {
+      throw new HttpsError('failed-precondition', 'Your next check-in is available ' + new Date(previous + DAY_MS).toISOString() + '.');
+    }
+    const dueAt = timestampMillis(membership.nextEarningAt);
+    let earningLedgerRef = null;
+    let earningLedgerExists = false;
+    if (previous !== null && dueAt !== null && dueAt > previous && dueAt <= previous + DAY_MS && now >= dueAt) {
+      earningLedgerRef = db.collection('transactions').doc('daily_' + uid + '_' + dueAt);
+      earningLedgerExists = (await transaction.get(earningLedgerRef)).exists;
+    }
+    const earning = earningLedgerRef && !earningLedgerExists ? DAILY_EARNING_AMOUNT : 0;
+    const previousDay = Number(user.dailyCheckin && user.dailyCheckin.day || 0);
+    const missedDeadline = previous === null || now - previous >= DAY_MS;
+    const nextDay = missedDeadline ? 1 : previousDay >= 7 ? 1 : previousDay + 1;
+    const balance = Number(user.balance || 0);
+    const totalEarned = Number(user.totalEarned || 0);
+    if (!Number.isSafeInteger(balance) || balance < 0 ||
+        !Number.isSafeInteger(totalEarned) || totalEarned < 0) {
+      throw new HttpsError('failed-precondition', 'Your wallet or earnings balance is invalid.');
+    }
+    const updatedBalance = balance + earning;
+    const updatedTotalEarned = totalEarned + earning;
+    if (!Number.isSafeInteger(updatedBalance) || !Number.isSafeInteger(updatedTotalEarned)) {
+      throw new HttpsError('failed-precondition', 'Your wallet cannot safely accept this earning.');
+    }
+    const checkedInAt = new Date(now);
+    const nextEarningAt = membership.active && missedDeadline ? now + DAY_MS : dueAt;
+    transaction.update(userRef, {
+      dailyCheckin: {
+        lastCheckinAt: checkedInAt,
+        day: nextDay,
+        registeredAt: (user.dailyCheckin && user.dailyCheckin.registeredAt) || user.createdAt || checkedInAt
+      },
+      ...(earning ? {
+        balance: updatedBalance,
+        totalEarned: updatedTotalEarned
+      } : {}),
+      ...(membership.active && missedDeadline ? {
+        'membership.nextEarningAt': new Date(nextEarningAt)
+      } : {})
+    });
+    if (earningLedgerRef && earning) {
+      transaction.create(earningLedgerRef, {
+        userId: uid,
+        userName: accountName(user, uid),
+        type: 'earning',
+        description: 'Daily C&J earning',
+        amount: earning,
+        date: FieldValue.serverTimestamp(),
+        status: 'completed'
+      });
+    }
+    return {
+      day: nextDay,
+      checkedInAt: now,
+      earning,
+      earningLedgerId: earningLedgerRef && earning ? earningLedgerRef.id : '',
+      balance: updatedBalance,
+      totalEarned: updatedTotalEarned,
+      nextEarningAt
+    };
+  });
 }
 
 function parseStake(value) {
@@ -1493,6 +1960,12 @@ exports.whotGetMatch = onCall({ timeoutSeconds: 120, memory: '512MiB' }, getWhot
 exports.whotPlay = onCall({ timeoutSeconds: 30 }, playWhotCard);
 exports.whotDraw = onCall({ timeoutSeconds: 30 }, drawWhotCard);
 exports.whotResign = onCall({ timeoutSeconds: 30 }, resignWhotMatch);
+
+exports.walletTransfer = onCall({ timeoutSeconds: 30 }, transferWallet);
+exports.walletSetTransferPin = onCall({ timeoutSeconds: 30 }, setTransferPin);
+exports.adminAdjustWallet = onCall({ timeoutSeconds: 30 }, adjustWalletAsAdmin);
+exports.claimDailyEarning = onCall({ timeoutSeconds: 30 }, claimDailyEarning);
+exports.claimDailyCheckin = onCall({ timeoutSeconds: 30 }, claimDailyCheckin);
 
 exports.chessStartBot = onCall({ timeoutSeconds: 30 }, startBotMatch);
 exports.chessJoinQueue = onCall({ timeoutSeconds: 30 }, joinHumanQueue);
