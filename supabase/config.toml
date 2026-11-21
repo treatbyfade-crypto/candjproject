@@ -2,3 +2,6 @@ project_id = "lcleywliqmyveoqnllgu"
 
 [functions.clear-all-data]
 verify_jwt = false
+
+[functions.cj-backend]
+verify_jwt = false
