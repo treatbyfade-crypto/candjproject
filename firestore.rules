@@ -1,0 +1,214 @@
+rules_version = '2';
+
+service cloud.firestore {
+  match /databases/{database}/documents {
+    function signedIn() {
+      return request.auth != null;
+    }
+
+    function isAdmin() {
+      return signedIn() && request.auth.token.email == 'admin@cj.com';
+    }
+
+    function owns(userId) {
+      return signedIn() && request.auth.uid == userId;
+    }
+
+    function safeInitialUser() {
+      let data = request.resource.data;
+      return data.get('balance', 0) == 0
+        && data.get('lagosLifeBalance', 0) == 0
+        && data.get('coinHoldings', 0) == 0
+        && data.get('goldHoldings', 0) == 0
+        && data.get('totalEarned', 0) == 0
+        && data.get('points', 0) == 0
+        && data.get('role', 'user') == 'user'
+        && data.get('accountStatus', 'active') == 'active'
+        && data.get('membership', {}).get('active', false) == false
+        && data.get('referrals', {}).get('registered', 0) == 0
+        && data.get('referrals', {}).get('active', 0) == 0
+        && data.get('hasTransferPin', false) == false;
+    }
+
+    function protectsServerFields() {
+      return !request.resource.data.diff(resource.data).affectedKeys().hasAny([
+        'balance',
+        'lagosLifeBalance',
+        'coinHoldings',
+        'goldHoldings',
+        'totalEarned',
+        'points',
+        'referrals',
+        'membership',
+        'dailyCheckin',
+        'referralActivated',
+        'referredBy',
+        'referredByUserId',
+        'referralCode',
+        'accountStatus',
+        'role',
+        'isAdmin',
+        'hasUsedIntroWithdrawal',
+        'hasTransferPin',
+        'transferPinSalt',
+        'transferPinHash',
+        'transferPinUpdatedAt'
+      ]);
+    }
+
+    function isServerControlledCollection(collection) {
+      return collection in [
+        'users',
+        'transactions',
+        'withdrawals',
+        'membershipRequests',
+        'verifications',
+        'referrals',
+        'announcements',
+        'settings',
+        'marketListings',
+        'connectProfiles',
+        'connectChatAccess',
+        'lagosLifeTransactions',
+        'lagosLifeDeposits',
+        'chessMatches',
+        'chessQueue',
+        'chessPlayers',
+        'whotMatches',
+        'whotQueue',
+        'whotPlayers',
+        'walletTransfers',
+        'transferPins',
+        'transferPinAttempts',
+        'adminWalletAdjustments'
+      ];
+    }
+
+    match /users/{userId} {
+      allow read: if signedIn();
+      allow create: if isAdmin() || (owns(userId) && safeInitialUser());
+      allow update: if isAdmin() || (owns(userId) && protectsServerFields());
+      allow delete: if isAdmin();
+
+      match /{subcollection}/{documentId} {
+        allow read: if isAdmin() || owns(userId);
+        allow write: if isAdmin();
+      }
+    }
+
+    match /transactions/{transactionId} {
+      allow read: if isAdmin() || (signedIn() && resource.data.userId == request.auth.uid);
+      allow write: if isAdmin();
+    }
+
+    match /withdrawals/{withdrawalId} {
+      allow read: if isAdmin() || (signedIn() && resource.data.userId == request.auth.uid);
+      allow write: if isAdmin();
+    }
+
+    match /membershipRequests/{requestId} {
+      allow read: if isAdmin() || (signedIn() && resource.data.userId == request.auth.uid);
+      allow create: if signedIn()
+        && request.resource.data.userId == request.auth.uid
+        && request.resource.data.status == 'pending';
+      allow update, delete: if isAdmin();
+    }
+
+    match /verifications/{userId} {
+      allow read: if isAdmin() || owns(userId);
+      allow create, update: if isAdmin() || (
+        owns(userId)
+        && request.resource.data.userId == userId
+        && request.resource.data.status in ['pending', 'rejected']
+      );
+      allow delete: if isAdmin();
+    }
+
+    match /referrals/{referralId} {
+      allow read, write: if isAdmin();
+    }
+
+    match /announcements/{announcementId} {
+      allow read: if signedIn();
+      allow write: if isAdmin();
+    }
+
+    match /settings/{settingId} {
+      allow read: if signedIn();
+      allow write: if isAdmin();
+    }
+
+    match /marketListings/{listingId} {
+      allow read: if signedIn();
+      allow write: if isAdmin();
+    }
+
+    match /connectProfiles/{profileId} {
+      allow read: if signedIn();
+      allow write: if isAdmin();
+    }
+
+    match /connectChatAccess/{accessId} {
+      allow read: if isAdmin() || (
+        signedIn()
+        && (resource.data.senderUserId == request.auth.uid
+          || resource.data.ownerUserId == request.auth.uid)
+      );
+      allow write: if isAdmin();
+    }
+
+    match /lagosLifeTransactions/{transactionId} {
+      allow read: if isAdmin() || (signedIn() && resource.data.userId == request.auth.uid);
+      allow write: if isAdmin();
+    }
+
+    match /lagosLifeDeposits/{depositId} {
+      allow read: if isAdmin() || (signedIn() && resource.data.userId == request.auth.uid);
+      allow write: if isAdmin();
+    }
+
+    match /chessMatches/{matchId} {
+      allow read, write: if isAdmin();
+    }
+
+    match /chessQueue/{queueId} {
+      allow read, write: if isAdmin();
+    }
+
+    match /chessPlayers/{playerId} {
+      allow read, write: if isAdmin();
+    }
+
+    match /whotMatches/{matchId} {
+      allow read, write: if isAdmin();
+    }
+
+    match /whotQueue/{queueId} {
+      allow read, write: if isAdmin();
+    }
+
+    match /whotPlayers/{playerId} {
+      allow read, write: if isAdmin();
+    }
+
+    match /walletTransfers/{transferId} {
+      allow read, write: if false;
+    }
+
+    match /transferPins/{userId} {
+      allow read, write: if false;
+    }
+
+    match /transferPinAttempts/{userId} {
+      allow read, write: if false;
+    }
+
+    match /adminWalletAdjustments/{adjustmentId} {
+      allow read, write: if false;
+    }
+
+    match /{collection}/{document=**} {
+      allow read, write: if isAdmin() || (signedIn() && !isServerControlledCollection(collection));
+    }
+  }
+}
